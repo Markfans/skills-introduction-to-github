@@ -1,0 +1,389 @@
+import pandas as pd # type: ignore
+import numpy as np
+import time
+from ta.momentum import RSIIndicator
+from ta.volatility import AverageTrueRange
+from okx import Account, Trade, MarketData
+import matplotlib.pyplot as plt # type: ignore
+import requests
+import json,os,csv
+
+# 企业微信机器人Webhook URL（替换为你的Webhook地址）
+WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=35591590-6906-4596-8e5f-b832fe12b88e"
+
+def send_bot_message(content):
+    """
+    通过企业微信机器人发送消息
+    """
+    url = WEBHOOK_URL
+    headers = {"Content-Type": "application/json"}
+    data = {
+        "msgtype": "text",
+        "text": {
+            "content": content,  # 消息内容
+            "mentioned_list": ["@all"]  # @全体成员，可指定具体成员的名字
+        }
+    }
+    response = requests.post(url, headers=headers, data=json.dumps(data))
+    if response.status_code != 200:
+       print(f"HTTP error: {response.status_code}, {response.text}")
+    else:
+       print(f"Response content: {res}")
+
+    if response.status_code == 200:
+        res = response.json()
+        if res.get("errcode") == 0:
+            print("Message sent successfully:", res)
+        else:
+            print("Error sending message:", res)
+    else:
+        print("HTTP error:", response.status_code, response.text)
+
+# 测试发送
+#if __name__ == "__main__":
+    #send_bot_message("这是一条来自Bot的测试消息！")
+
+# API 信息
+API_KEY = '60ef7e5f-5551-4efe-907d-08112e031701'
+SECRET_KEY = '621F8531F343299B0BC92D3AD869E62C'
+PASSPHRASE = 'Aa1234567.'
+FLAG = '1'  # 1 表示模拟交易，0 表示实盘交易
+
+# 实例化 OKX 的 API 模块
+accountAPI = Account.AccountAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, FLAG)
+marketAPI = MarketData.MarketAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, FLAG)
+tradeAPI = Trade.TradeAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, FLAG)
+
+# 获取所有现货交易对
+def get_all_symbols(limit=1000, min_volume=1000000):
+    """
+    获取所有 USDT 本位的现货交易对，排除低流动性币种
+    :param limit: 最大返回交易对数量
+    :param min_volume: 最小24小时交易量，单位USDT
+    """
+    try:
+        response = marketAPI.get_tickers(instType="SPOT")
+        if response['code'] == '0':
+            data = response['data']
+            # 筛选 USDT 本位交易对并检查交易量
+            usdt_symbols = [
+                item['instId'] for item in data
+                if item['instId'].endswith("-USDT") and float(item['volCcy24h']) >= min_volume
+            ]
+            return usdt_symbols[:limit]  # 限制返回的数量
+        else:
+            print(f"Error fetching symbols: {response['msg']}")
+            return []
+    except Exception as e:
+        print(f"Error fetching symbols: {e}")
+        return []
+
+
+
+def get_symbols_with_balance():
+    """
+    获取账户中有余额的币种，并筛选出 USDT 本位的交易对
+    """
+    try:
+        response = accountAPI.get_account_balance()
+        if response['code'] == '0':
+            # 获取账户中有余额的币种
+            coins_with_balance = [
+                asset['ccy'] for asset in response['data'][0]['details']
+                if float(asset['availBal']) > 0
+            ]
+            print(f"Coins with balance: {coins_with_balance}")
+
+            # 获取 USDT 本位的交易对
+            usdt_symbols = get_all_symbols(limit=1000)  # 获取更多交易对
+            symbols_with_balance = [
+                symbol for symbol in usdt_symbols
+                if symbol.split("-")[0] in coins_with_balance or symbol.endswith("-USDT")  # 检查余额或 USDT 本位
+            ]
+            print(f"Symbols with balance: {symbols_with_balance}")
+            return symbols_with_balance
+        else:
+            print(f"Error fetching balance: {response['msg']}")
+            return []
+    except Exception as e:
+        print(f"Error fetching symbols with balance: {e}")
+        return []
+
+
+
+# 获取市场数据
+def fetch_data(symbol, timeframe, limit=200):
+    try:
+        print(f"Fetching data for {symbol} with timeframe {timeframe}")
+        response = marketAPI.get_candlesticks(instId=symbol, bar=timeframe, limit=limit)
+        if response['code'] == '0':
+            data = response['data']
+            # 检查返回数据列数，动态调整列名
+            columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            if len(data[0]) > 6:  # 如果返回了额外字段，例如 [timestamp, open, high, low, close, volume, ...]
+                columns += ['extra_' + str(i) for i in range(len(data[0]) - 6)]
+
+            df = pd.DataFrame(data, columns=columns)
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+            print(df.head())  # 打印前几行调试
+            return df
+        else:
+            print(f"Error fetching data: {response['msg']}")
+            return None
+    except Exception as e:
+        print(f"Error fetching data: {e}")
+        return None
+
+
+# 计算 QQE 指标
+def calculate_qqe(data, rsi_length=14, smoothing_factor=5):
+    if len(data) < rsi_length:
+        print(f"Not enough data to calculate QQE, required: {rsi_length}, available: {len(data)}")
+        return None
+
+    rsi = RSIIndicator(close=data['close'], window=rsi_length).rsi()
+    data['RSI'] = rsi
+    smoothed_rsi = rsi.ewm(span=smoothing_factor).mean()
+    data['Smoothed_RSI'] = smoothed_rsi
+    atr = AverageTrueRange(high=data['high'], low=data['low'], close=data['close'], window=rsi_length).average_true_range()
+    data['ATR'] = atr
+
+    ww_alpha = 1 / rsi_length
+    data['WWMA'] = ww_alpha * abs(smoothed_rsi.diff()) + (1 - ww_alpha) * data['ATR']
+    data['QQE_Fast'] = smoothed_rsi
+    data['QQE_Slow'] = smoothed_rsi + data['WWMA'] * 4.236
+
+    #data['Buy_Signal'] = (data['QQE_Fast'] > data['QQE_Slow']) & (data['QQE_Fast'].shift(1) <= data['QQE_Slow'].shift(1))
+    #data['Sell_Signal'] = (data['QQE_Fast'] < data['QQE_Slow']) & (data['QQE_Fast'].shift(1) >= data['QQE_Slow'].shift(1))
+    data['Buy_Signal'] = (data['QQE_Fast'] > data['QQE_Slow'] * 0.98)  # 调整 QQE 快慢线的比较条件
+    data['Sell_Signal'] = (data['QQE_Fast'] < data['QQE_Slow'] * 1.02)  # 放宽触发条件
+
+    return data
+
+
+# 执行交易
+def execute_trade(symbol, side, amount):
+    """
+    执行交易
+    """
+    if not check_balance(symbol, side):
+        print(f"Skipping trade for {symbol} due to insufficient balance.")
+        return False  # 返回 False，表示交易未执行
+
+    try:
+        print(f"Attempting to execute trade: {side.upper()} {amount} {symbol}")
+        order = tradeAPI.place_order(
+            instId=symbol,
+            tdMode="cash",  # 确认使用现金账户模式
+            side=side,
+            ordType="market",
+            sz=str(amount)
+        )
+        print(f"Order Response: {order}")  # 打印订单完整响应
+        if order['code'] == '0':
+            print(f"Order executed successfully: {order}")
+            return True  # 返回 True，表示交易成功
+        else:
+            print(f"Error executing trade: {order['msg']}")
+            return False  # 返回 False，表示交易失败
+    except Exception as e:
+        print(f"Error during trade execution: {e}")
+        return False  # 返回 False，表示出现异常
+
+
+def check_balance(symbol, side):
+    """
+    检查账户余额是否足够
+    :param symbol: 交易对，例如 'LUNA-USDT'
+    :param side: 'buy' 或 'sell'
+    :return: True 表示余额足够，False 表示余额不足
+    """
+    try:
+        # 获取基础货币和报价货币
+        base_currency, quote_currency = symbol.split("-")
+        target_currency = quote_currency if side == "buy" else base_currency
+
+        # 获取账户余额
+        response = accountAPI.get_account_balance()
+        if response['code'] == '0':
+            for asset in response['data'][0]['details']:
+                if asset['ccy'] == target_currency:
+                    available_balance = float(asset['availBal'])
+                    print(f"{target_currency} available balance: {available_balance}")
+                    
+                    # 检查余额是否足够
+                    required_balance = trade_amount if side == "sell" else trade_amount * 1.01  # 考虑滑点
+                    if available_balance >= required_balance:
+                        return True
+                    else:
+                        print(f"Insufficient balance for {target_currency}. Required: {required_balance}, Available: {available_balance}")
+                        return False
+        else:
+            print(f"Error fetching balance: {response['msg']}")
+            return False
+    except Exception as e:
+        print(f"Error during balance check: {e}")
+        return False
+
+
+
+
+
+def fetch_and_process_data(symbol, timeframe, limit=200):
+    """
+    从 OKX 获取行情数据并处理（生成信号），排除异常交易对
+    """
+    df = fetch_data(symbol, timeframe, limit=limit)
+    if df is None or df.empty:
+        print(f"No data for {symbol}. Skipping.")
+        return None
+
+    # 确保数据足够
+    if len(df) < limit:
+        print(f"Insufficient data for {symbol}. Skipping.")
+        return None
+
+    # 计算 QQE 指标
+    processed_data = calculate_qqe(df)
+    return processed_data
+
+
+# 自动交易策略
+def run_strategy(symbol, timeframe, trade_amount):
+    data = fetch_data(symbol, timeframe)
+    if data is None:
+        return
+
+    data = calculate_qqe(data)
+    if data is None:
+        return
+
+    # 检查信号
+    latest = data.iloc[-1]
+    if latest['Buy_Signal']:
+        print("Buy signal detected!")
+        execute_trade(symbol, 'buy', trade_amount)
+    elif latest['Sell_Signal']:
+        print("Sell signal detected!")
+        execute_trade(symbol, 'sell', trade_amount)
+    else:
+        print("No signal detected.")
+import matplotlib.pyplot as plt
+
+def log_trade(symbol, signal_type, trade_amount, price, log_file="trading_log.csv"):
+    """
+    记录交易日志
+    :param symbol: 交易对
+    :param signal_type: 信号类型（买入或卖出）
+    :param trade_amount: 交易数量
+    :param price: 触发信号时的价格
+    :param log_file: 日志文件
+    """
+    headers = ["Timestamp", "Symbol", "Signal", "Amount", "Price"]
+    row = [time.strftime('%Y-%m-%d %H:%M:%S'), symbol, signal_type, trade_amount, price]
+
+    # 写入日志文件
+    file_exists = os.path.isfile(log_file)
+    with open(log_file, mode="a", newline="") as file:
+        writer = csv.writer(file)
+        if not file_exists:
+            writer.writerow(headers)  # 写入表头
+        writer.writerow(row)
+
+    print(f"Logged trade to {log_file}: {row}")
+
+
+def plot_data(df, symbol, signal_type, save_dir="qqe_charts"):
+    """
+    绘制K线图、QQE指标和信号，并保存图表
+    :param df: 数据框
+    :param symbol: 交易对
+    :param signal_type: 信号类型（买入或卖出）
+    :param save_dir: 图表保存目录
+    """
+    if df is None or df.empty:
+        print("No data to plot")
+        return
+
+    # 创建保存目录
+    os.makedirs(save_dir, exist_ok=True)
+
+    plt.figure(figsize=(14, 8))
+
+    # 绘制K线图
+    plt.plot(df['timestamp'], df['close'], label='Close Price', color='blue', alpha=0.7)
+
+    # 绘制QQE指标
+    plt.plot(df['timestamp'], df['QQE_Fast'], label='QQE Fast', color='green', linestyle='--')
+    plt.plot(df['timestamp'], df['QQE_Slow'], label='QQE Slow', color='red', linestyle='--')
+
+    # 绘制买卖信号
+    buy_signals = df[df['Buy_Signal']]
+    sell_signals = df[df['Sell_Signal']]
+    plt.scatter(buy_signals['timestamp'], buy_signals['close'], label='Buy Signal', color='green', marker='^', alpha=1)
+    plt.scatter(sell_signals['timestamp'], sell_signals['close'], label='Sell Signal', color='red', marker='v', alpha=1)
+
+    # 图表修饰
+    plt.title(f"QQE Signals for {symbol} ({signal_type})", fontsize=16)
+    plt.xlabel("Timestamp", fontsize=12)
+    plt.ylabel("Price", fontsize=12)
+    plt.legend()
+    plt.grid(alpha=0.3)
+
+    # 保存图表
+    filename = f"{save_dir}/{symbol}_{signal_type}_{time.strftime('%Y%m%d_%H%M%S')}.png"
+    plt.savefig(filename)
+    print(f"Saved QQE chart to {filename}")
+
+    plt.close()  # 关闭图表
+
+
+
+# 定期运行
+if __name__ == "__main__":
+    timeframe = "5m"  # 时间间隔
+    limit = 200  # 数据点数
+    trade_amount = 20  # 每笔交易的数量
+    min_volume = 1000000  # 最小24小时交易量
+
+    while True:
+        try:
+            # 获取符合条件的交易对
+            symbols = get_all_symbols(min_volume=min_volume)
+
+            for symbol in symbols:
+                print(f"Processing symbol: {symbol}")
+                # 获取并处理数据
+                data = fetch_and_process_data(symbol, timeframe, limit)
+
+                if data is not None:
+                    print(data.tail())  # 打印最新数据
+
+                    # 检查信号
+                    latest = data.iloc[-1]
+                    if latest['Buy_Signal']:
+                        print(f"Buy signal detected for {symbol}!")
+                        if execute_trade(symbol, 'buy', trade_amount):
+                            # 保存图表和记录日志
+                            plot_data(data, symbol, "Buy")
+                            log_trade(symbol, "Buy", trade_amount, latest['close'])
+                            send_bot_message(f"交易类型：现货\n交易信号：买入\n交易对：{symbol}\n价格：{latest['close']}\n时间：{time.ctime()}")
+                    elif latest['Sell_Signal']:
+                        print(f"Sell signal detected for {symbol}!")
+                        if execute_trade(symbol, 'sell', trade_amount):
+                            # 保存图表和记录日志
+                            plot_data(data, symbol, "Sell")
+                            log_trade(symbol, "Sell", trade_amount, latest['close'])
+                            send_bot_message(f"交易类型：现货\n交易信号：卖出\n交易对：{symbol}\n价格：{latest['close']}\n时间：{time.ctime()}")
+                    else:
+                        print(f"No signal detected for {symbol}.")
+                else:
+                    print(f"Data fetch or processing failed for {symbol}.")
+
+            # 等待一分钟
+            time.sleep(60)
+
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+
